@@ -490,6 +490,11 @@ export class GaussianSplattingMeshBase extends Mesh {
     protected _worker: Nullable<Worker> = null;
     private _modelViewProjectionMatrix = Matrix.Identity();
     private _depthMix: BigInt64Array;
+    // Recycled compact (non-interleaved) sorted-index buffer: sent to the worker on each sort request and
+    // replaced with the one the worker just produced in its response (see the worker's `sortedIndex`),
+    // mirroring how `_depthMix` itself is round-tripped. Lets the worker hand back a result the main
+    // thread can apply with a single `.set()`, instead of a manual per-element strided copy every sort.
+    private _sortedIndexBuffer: Nullable<Float32Array> = null;
     protected _canPostToWorker = true;
     private _readyToDisplay = false;
     private _sortRequestId = 0;
@@ -1408,6 +1413,10 @@ export class GaussianSplattingMeshBase extends Mesh {
                     cameraViewInfos.frameIdLastUpdate = frameId;
                     this._canPostToWorker = false;
                     if (this._worker) {
+                        const transfer: Transferable[] = [this._depthMix.buffer];
+                        if (this._sortedIndexBuffer) {
+                            transfer.push(this._sortedIndexBuffer.buffer);
+                        }
                         this._worker.postMessage(
                             {
                                 command: GaussianSplattingSortWorkerCommand.SORT,
@@ -1415,6 +1424,7 @@ export class GaussianSplattingMeshBase extends Mesh {
                                 cameraForward: [cameraViewMatrix.m[2], cameraViewMatrix.m[6], cameraViewMatrix.m[10]],
                                 cameraPosition: [camera.globalPosition.x, camera.globalPosition.y, camera.globalPosition.z],
                                 depthMix: this._depthMix,
+                                sortedIndexBuffer: this._sortedIndexBuffer ?? undefined,
                                 cameraId: camera.uniqueId,
                                 sortRequestId: cameraViewInfos.sortRequestId,
                                 rangeVersion: this._activeRangeVersion,
@@ -1422,8 +1432,10 @@ export class GaussianSplattingMeshBase extends Mesh {
                                 rightHanded: this._scene.useRightHandedSystem,
                                 logSortPerformance: GaussianSplattingMeshBase.LogSortPerformance,
                             },
-                            [this._depthMix.buffer]
+                            transfer
                         );
+                        // Ownership was just transferred to the worker; this thread no longer holds it.
+                        this._sortedIndexBuffer = null;
                     } else if (Native?.sortSplats) {
                         if (this._activeSplatRanges) {
                             // Native sort can't filter ranges: fall back to the (already range-filtered) identity index buffer.
@@ -3127,8 +3139,18 @@ export class GaussianSplattingMeshBase extends Mesh {
                 });
             }
 
-            const indexMix = new Uint32Array(e.data.depthMix.buffer);
-            if (this._splatIndex) {
+            if (this._splatIndex && e.data.sortedIndex && e.data.sortedIndex.length === renderedPadded) {
+                // Fast path: the worker already extracted the compact (non-interleaved) sorted indices, so
+                // apply them with a single native bulk copy instead of a manual per-element strided loop.
+                // `.set()` writes into the existing `_splatIndex` object (never reassigns it), preserving
+                // the reference thinInstanceSetBuffer bound earlier -- required for thinInstanceBufferUpdated
+                // to pick up the new contents.
+                this._splatIndex.set(e.data.sortedIndex);
+                // Recycle the buffer the worker just handed back for the next sort request.
+                this._sortedIndexBuffer = e.data.sortedIndex;
+            } else if (this._splatIndex) {
+                // Fallback (e.g. an older/mismatched worker response): de-interleave on the main thread.
+                const indexMix = new Uint32Array(e.data.depthMix.buffer);
                 for (let j = 0; j < renderedPadded; j++) {
                     this._splatIndex[j] = indexMix[2 * j];
                 }

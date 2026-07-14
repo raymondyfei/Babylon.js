@@ -43,6 +43,10 @@ export const GaussianSplattingSortWorkerCommand = {
 export const GaussianSplattingSortWorker = function (self: Worker) {
     let positions: Float32Array;
     let depthMix: BigInt64Array;
+    // Compact (non-interleaved) sorted-index output, recycled the same way as `depthMix`: the main
+    // thread sends its previous buffer back on each `sort` message (see `sortedIndexBuffer` below) and
+    // receives a fresh one in the `sorted` response, so no allocation is needed once warmed up.
+    let sortedIndex: Float32Array;
     let partIndices: Uint8Array;
     let partMatrices: Float32Array[];
     // Active source-splat intervals as flat [start0, count0, start1, count1, ...]. Persisted between
@@ -82,10 +86,19 @@ export const GaussianSplattingSortWorker = function (self: Worker) {
             const cameraPosition = e.data.cameraPosition;
 
             depthMix = e.data.depthMix;
+            // Recycled compact-index buffer from the main thread's previous "sorted" message (undefined
+            // on the very first sort, or if the main thread hasn't received one yet).
+            if (e.data.sortedIndexBuffer) {
+                sortedIndex = e.data.sortedIndexBuffer;
+            }
 
             if (!positions || !cameraForward) {
-                // Sort request arrived before positions were initialized — return the buffer unchanged so the main thread can unlock _canPostToWorker.
-                self.postMessage({ command: "sorted", depthMix, cameraId, sortRequestId, rangeVersion }, [depthMix.buffer]);
+                // Sort request arrived before positions were initialized — return the buffers unchanged so the main thread can unlock _canPostToWorker.
+                const transfer = [depthMix.buffer];
+                if (sortedIndex) {
+                    transfer.push(sortedIndex.buffer);
+                }
+                self.postMessage({ command: "sorted", depthMix, sortedIndex, cameraId, sortRequestId, rangeVersion }, transfer);
                 return;
             }
 
@@ -115,6 +128,12 @@ export const GaussianSplattingSortWorker = function (self: Worker) {
                 }
             }
             const vertexCountPadded = Math.max((renderSplatCount + 15) & ~0xf, 16);
+
+            // The recycled buffer must match this sort's exact padded count (it's `.set()` directly into
+            // the main thread's stable splatIndex array); reallocate only when the count actually changed.
+            if (!sortedIndex || sortedIndex.length !== vertexCountPadded) {
+                sortedIndex = new Float32Array(vertexCountPadded);
+            }
 
             // depth = dot(cameraForward, worldPos - cameraPos)
             const camDot = cameraForward[0] * cameraPosition[0] + cameraForward[1] * cameraPosition[1] + cameraForward[2] * cameraPosition[2];
@@ -328,7 +347,16 @@ export const GaussianSplattingSortWorker = function (self: Worker) {
                 console.log(`[GaussianSplatting] ${useCountingSort ? "counting" : "legacy"} sort: ${renderSplatCount} splats in ${(perf.now() - sortStart).toFixed(2)}ms`);
             }
 
-            self.postMessage({ command: "sorted", depthMix, cameraId, sortRequestId, rangeVersion }, [depthMix.buffer]);
+            // Extract the compact (non-interleaved) sorted indices here, off the main thread, so the main
+            // thread can apply the result with a single `.set()` instead of a manual per-element strided
+            // copy on every completed sort. Both sort paths (and the error path, reading whatever is
+            // currently in the buffer) share the same even-32-bit-word layout in depthMix.
+            const finalIndices = new Uint32Array(depthMix.buffer);
+            for (let j = 0; j < vertexCountPadded; j++) {
+                sortedIndex[j] = finalIndices[2 * j];
+            }
+
+            self.postMessage({ command: "sorted", depthMix, sortedIndex, cameraId, sortRequestId, rangeVersion }, [depthMix.buffer, sortedIndex.buffer]);
         }
     };
 };
