@@ -69,12 +69,30 @@ export class WebGPUBufferManager {
         return dataBuffer;
     }
 
+    // Measured on Chrome (Dawn): a single queue.writeBuffer call gets ~8x more expensive per byte once
+    // byteLength crosses somewhere between 2MB and 4MB (0.17ms @ 2MB vs 1.34ms @ 4MB for otherwise identical
+    // calls), while WebGL2's bufferSubData scales linearly with no such cliff. Splitting a large write into
+    // chunks below the cliff avoids it entirely (8MB: 2.57ms in one call vs 0.27ms split into 16 calls),
+    // with no semantic difference since it's the same bytes going to the same destination.
+    private static readonly _WriteBufferChunkThreshold = 2 * 1024 * 1024;
+    private static readonly _WriteBufferChunkSize = 1 * 1024 * 1024;
+
     // This calls GPUBuffer.writeBuffer() with no alignment corrections
     // dstByteOffset and byteLength must both be aligned to 4 bytes and bytes moved must be within src and dst arrays
     public setRawData(buffer: GPUBuffer, dstByteOffset: number, src: ArrayBufferView, srcByteOffset: number, byteLength: number): void {
         srcByteOffset += src.byteOffset;
 
-        this._device.queue.writeBuffer(buffer, dstByteOffset, src.buffer, srcByteOffset, byteLength);
+        if (byteLength <= WebGPUBufferManager._WriteBufferChunkThreshold) {
+            this._device.queue.writeBuffer(buffer, dstByteOffset, src.buffer, srcByteOffset, byteLength);
+            return;
+        }
+
+        let offset = 0;
+        while (offset < byteLength) {
+            const chunkLength = Math.min(WebGPUBufferManager._WriteBufferChunkSize, byteLength - offset);
+            this._device.queue.writeBuffer(buffer, dstByteOffset + offset, src.buffer, srcByteOffset + offset, chunkLength);
+            offset += chunkLength;
+        }
     }
 
     // This calls GPUBuffer.writeBuffer() with alignment corrections (dstByteOffset and byteLength will be aligned to 4 byte boundaries)
