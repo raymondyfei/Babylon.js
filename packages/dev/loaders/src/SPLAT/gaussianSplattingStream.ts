@@ -19,6 +19,7 @@ import { GaussianSplattingWorkBuffer } from "./gaussianSplattingWorkBuffer";
 import { GaussianSplattingDownloadManager } from "./gaussianSplattingDownloadManager";
 import { GaussianSplattingResidencyController } from "./gaussianSplattingResidencyController";
 import { type ISogTexturePack } from "./splatDefs";
+import { gsDebugFrameTick, gsDebugLog } from "./gaussianSplattingDebugStats"; // TEMP DEBUG (perf investigation)
 
 /**
  * A single LOD variant of a tree node: a contiguous splat range inside one streamed SOG file.
@@ -1221,6 +1222,7 @@ export class GaussianSplattingStream extends GaussianSplattingMesh {
         if (this._decodedFiles.has(fileId) || this._loadingFiles.has(fileId) || !this._residency) {
             return;
         }
+        gsDebugLog("decodeFileAsync.start", { fileId }); // TEMP DEBUG (perf investigation)
         const meta = this._fileMeta.get(fileId);
         const count = this._fileCounts.get(fileId);
         if (!meta || count === undefined) {
@@ -1245,6 +1247,7 @@ export class GaussianSplattingStream extends GaussianSplattingMesh {
                 let base = this._residency.allocate(fileId, count);
                 if (base === null) {
                     // Defragment the work buffer to reclaim fragmented free space, then retry.
+                    gsDebugLog("decodeFileAsync.allocateFailed_triggeringRelayout", { fileId, count }); // TEMP DEBUG (perf investigation)
                     base = await this._relayoutAndAllocateAsync(fileId, count);
                 }
                 if (base === null) {
@@ -1356,6 +1359,7 @@ export class GaussianSplattingStream extends GaussianSplattingMesh {
             oldOffsets.set(block.file, block.offset);
         }
         const moves = this._residency.compact();
+        gsDebugLog("performRelayout.compact", { movesCount: moves.length }); // TEMP DEBUG (perf investigation)
         if (moves.length === 0) {
             return;
         }
@@ -1407,6 +1411,7 @@ export class GaussianSplattingStream extends GaussianSplattingMesh {
      * @param fileId evicted file index
      */
     private _onFileEvicted(fileId: number): void {
+        gsDebugLog("onFileEvicted", { fileId }); // TEMP DEBUG (perf investigation)
         this._decodedFiles.delete(fileId);
     }
 
@@ -1461,7 +1466,9 @@ export class GaussianSplattingStream extends GaussianSplattingMesh {
      */
     private _applyDesiredLods(): boolean {
         let dirty = false;
-        for (const node of this._leafNodes) {
+        const _switches: Array<{ node: number; from: number | undefined; to: number }> = []; // TEMP DEBUG (perf investigation)
+        for (let _i = 0; _i < this._leafNodes.length; _i++) {
+            const node = this._leafNodes[_i];
             // Nodes in cooldown keep their current LOD and their existing pending request untouched.
             if (node.lodCooldown && node.lodCooldown > 0) {
                 continue;
@@ -1472,6 +1479,7 @@ export class GaussianSplattingStream extends GaussianSplattingMesh {
                 const entry = node.lods![String(desired)];
                 if (entry) {
                     if (this._decodedFiles.has(entry.file)) {
+                        _switches.push({ node: _i, from: node.activeLod, to: desired }); // TEMP DEBUG (perf investigation)
                         this._switchActiveFile(node, entry.file);
                         node.activeLod = desired;
                         node.lodCooldown = this._lodCooldownFrames;
@@ -1491,6 +1499,9 @@ export class GaussianSplattingStream extends GaussianSplattingMesh {
                 }
                 node.pendingFile = newPending;
             }
+        }
+        if (_switches.length > 0) {
+            gsDebugLog("applyDesiredLods.switches", { switches: _switches }); // TEMP DEBUG (perf investigation)
         }
         return dirty;
     }
@@ -1582,6 +1593,7 @@ export class GaussianSplattingStream extends GaussianSplattingMesh {
      * that base level promptly once it expires, even at a fixed camera pose.
      */
     private _onLodFrame(): void {
+        const _dbg = gsDebugFrameTick();
         if (this._disposed || !this._baseLayerReady) {
             return;
         }
@@ -1595,17 +1607,24 @@ export class GaussianSplattingStream extends GaussianSplattingMesh {
             }
         }
         // Tick eviction cooldowns: unreferenced files are freed once their cooldown elapses (budgeted streaming).
+        let evicted: number[] = [];
         if (this._evictionEnabled) {
-            this._residency?.tick();
+            evicted = this._residency?.tick() ?? [];
+            if (evicted.length > 0) {
+                gsDebugLog("residency.tick.evicted", { evicted });
+            }
         }
         // In-flight/queued decodes still progress every frame.
+        const _decodeQueueLenBefore = this._decodeQueue.length;
         this._pumpDecodeQueue();
 
         // Per-node frustum test runs every frame (cheap) so the off-screen LOD bias tracks camera rotation,
         // not just the translation that gates the throttled LOD re-evaluation below.
         const frustumChanged = this._updateNodeFrustum();
 
+        const _forced = this._forceLodUpdate;
         let runLodEval = this._forceLodUpdate || frustumChanged || cooldownExpiredWithPendingSwitch;
+        let _distanceTriggered = false;
         if (!runLodEval && ++this._framesSinceLodUpdate >= this._lodUpdateInterval) {
             const camera = this._scene.activeCamera;
             const threshold = this._lodUpdateDistance;
@@ -1614,18 +1633,45 @@ export class GaussianSplattingStream extends GaussianSplattingMesh {
                     this._lastLodCamPos.copyFrom(camera.globalPosition);
                 }
                 runLodEval = true;
+                _distanceTriggered = true;
             }
         }
 
+        let _dirty = false;
         if (runLodEval) {
             this._forceLodUpdate = false;
             this._framesSinceLodUpdate = 0;
             this.evaluateOptimalLods(this._scene.activeCamera);
             this._computeTargetLevels();
-            if (this._applyDesiredLods()) {
+            _dirty = this._applyDesiredLods();
+            if (_dirty) {
                 this._refreshActiveRanges();
             }
         }
+
+        gsDebugLog("onLodFrame", {
+            dtMs: Math.round(_dbg.dt),
+            runLodEval,
+            reason: runLodEval
+                ? _forced
+                    ? "forced"
+                    : frustumChanged
+                      ? "frustum"
+                      : cooldownExpiredWithPendingSwitch
+                        ? "cooldown"
+                        : _distanceTriggered
+                          ? "distance"
+                          : "unknown"
+                : "none",
+            lodChanged: _dirty,
+            decodeQueueLenBefore: _decodeQueueLenBefore,
+            decodeQueueLenAfter: this._decodeQueue.length,
+            loadingFiles: this._loadingFiles.size,
+            decodedFiles: this._decodedFiles.size,
+            residentCount: this._residency?.residentCount,
+            freeSize: this._residency?.freeSize,
+            evictedCount: evicted.length,
+        });
     }
 
     /**
