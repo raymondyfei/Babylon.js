@@ -1594,6 +1594,14 @@ export class GaussianSplattingStream extends GaussianSplattingMesh {
      */
     private _onLodFrame(): void {
         const _dbg = GsDebugFrameTick();
+        // TEMP DEBUG (perf investigation): isolate whether the frame-to-frame gap (_dbg.dt) is spent inside
+        // this frame's own synchronous render call (JS + WebGPU command submission) or entirely outside it
+        // (GPU/driver-side backpressure delaying the next requestAnimationFrame).
+        const _renderSyncStart = typeof performance !== "undefined" ? performance.now() : Date.now();
+        this._scene.onAfterRenderObservable.addOnce(() => {
+            const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+            GsDebugLog("frameRenderSyncMs", { syncMs: Math.round(now - _renderSyncStart) });
+        });
         if (this._disposed || !this._baseLayerReady) {
             return;
         }
