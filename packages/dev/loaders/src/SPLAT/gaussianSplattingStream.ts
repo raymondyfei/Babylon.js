@@ -19,7 +19,7 @@ import { GaussianSplattingWorkBuffer } from "./gaussianSplattingWorkBuffer";
 import { GaussianSplattingDownloadManager } from "./gaussianSplattingDownloadManager";
 import { GaussianSplattingResidencyController } from "./gaussianSplattingResidencyController";
 import { type ISogTexturePack } from "./splatDefs";
-import { gsDebugFrameTick, gsDebugLog } from "./gaussianSplattingDebugStats"; // TEMP DEBUG (perf investigation)
+import { GsDebugFrameTick, GsDebugLog } from "./gaussianSplattingDebugStats"; // TEMP DEBUG (perf investigation)
 
 /**
  * A single LOD variant of a tree node: a contiguous splat range inside one streamed SOG file.
@@ -1222,7 +1222,7 @@ export class GaussianSplattingStream extends GaussianSplattingMesh {
         if (this._decodedFiles.has(fileId) || this._loadingFiles.has(fileId) || !this._residency) {
             return;
         }
-        gsDebugLog("decodeFileAsync.start", { fileId }); // TEMP DEBUG (perf investigation)
+        GsDebugLog("decodeFileAsync.start", { fileId }); // TEMP DEBUG (perf investigation)
         const meta = this._fileMeta.get(fileId);
         const count = this._fileCounts.get(fileId);
         if (!meta || count === undefined) {
@@ -1247,7 +1247,7 @@ export class GaussianSplattingStream extends GaussianSplattingMesh {
                 let base = this._residency.allocate(fileId, count);
                 if (base === null) {
                     // Defragment the work buffer to reclaim fragmented free space, then retry.
-                    gsDebugLog("decodeFileAsync.allocateFailed_triggeringRelayout", { fileId, count }); // TEMP DEBUG (perf investigation)
+                    GsDebugLog("decodeFileAsync.allocateFailed_triggeringRelayout", { fileId, count }); // TEMP DEBUG (perf investigation)
                     base = await this._relayoutAndAllocateAsync(fileId, count);
                 }
                 if (base === null) {
@@ -1359,7 +1359,7 @@ export class GaussianSplattingStream extends GaussianSplattingMesh {
             oldOffsets.set(block.file, block.offset);
         }
         const moves = this._residency.compact();
-        gsDebugLog("performRelayout.compact", { movesCount: moves.length }); // TEMP DEBUG (perf investigation)
+        GsDebugLog("performRelayout.compact", { movesCount: moves.length }); // TEMP DEBUG (perf investigation)
         if (moves.length === 0) {
             return;
         }
@@ -1411,7 +1411,7 @@ export class GaussianSplattingStream extends GaussianSplattingMesh {
      * @param fileId evicted file index
      */
     private _onFileEvicted(fileId: number): void {
-        gsDebugLog("onFileEvicted", { fileId }); // TEMP DEBUG (perf investigation)
+        GsDebugLog("onFileEvicted", { fileId }); // TEMP DEBUG (perf investigation)
         this._decodedFiles.delete(fileId);
     }
 
@@ -1501,7 +1501,7 @@ export class GaussianSplattingStream extends GaussianSplattingMesh {
             }
         }
         if (_switches.length > 0) {
-            gsDebugLog("applyDesiredLods.switches", { switches: _switches }); // TEMP DEBUG (perf investigation)
+            GsDebugLog("applyDesiredLods.switches", { switches: _switches }); // TEMP DEBUG (perf investigation)
         }
         return dirty;
     }
@@ -1593,7 +1593,7 @@ export class GaussianSplattingStream extends GaussianSplattingMesh {
      * that base level promptly once it expires, even at a fixed camera pose.
      */
     private _onLodFrame(): void {
-        const _dbg = gsDebugFrameTick();
+        const _dbg = GsDebugFrameTick();
         if (this._disposed || !this._baseLayerReady) {
             return;
         }
@@ -1611,7 +1611,7 @@ export class GaussianSplattingStream extends GaussianSplattingMesh {
         if (this._evictionEnabled) {
             evicted = this._residency?.tick() ?? [];
             if (evicted.length > 0) {
-                gsDebugLog("residency.tick.evicted", { evicted });
+                GsDebugLog("residency.tick.evicted", { evicted });
             }
         }
         // In-flight/queued decodes still progress every frame.
@@ -1649,7 +1649,7 @@ export class GaussianSplattingStream extends GaussianSplattingMesh {
             }
         }
 
-        gsDebugLog("onLodFrame", {
+        GsDebugLog("onLodFrame", {
             dtMs: Math.round(_dbg.dt),
             runLodEval,
             reason: runLodEval

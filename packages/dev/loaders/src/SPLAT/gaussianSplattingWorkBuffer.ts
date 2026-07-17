@@ -20,7 +20,7 @@ import {
     GaussianSplattingWorkBufferRelayoutShaderName,
 } from "./gaussianSplattingWorkBufferShaders";
 import { RawTexture } from "core/Materials/Textures/rawTexture";
-import { gsDebugLog } from "./gaussianSplattingDebugStats"; // TEMP DEBUG (perf investigation)
+import { GsDebugLog } from "./gaussianSplattingDebugStats"; // TEMP DEBUG (perf investigation)
 
 /**
  * A unified, GPU-decoded Gaussian Splatting work buffer.
@@ -104,7 +104,7 @@ export class GaussianSplattingWorkBuffer {
      * @returns the created MRT
      */
     private _createMrt(name: string, disableClear: boolean): MultiRenderTarget {
-        gsDebugLog("workBuffer.createMrt", { name, textureSize: this._textureSize }); // TEMP DEBUG (perf investigation)
+        GsDebugLog("workBuffer.createMrt", { name, textureSize: this._textureSize }); // TEMP DEBUG (perf investigation)
         const mrt = new MultiRenderTarget(
             name,
             { width: this._textureSize, height: this._textureSize },
@@ -144,7 +144,7 @@ export class GaussianSplattingWorkBuffer {
         if (this._disposed) {
             return;
         }
-        gsDebugLog("workBuffer.decodeAsync", { offset, splatCount: pack.splatCount }); // TEMP DEBUG (perf investigation)
+        GsDebugLog("workBuffer.decodeAsync", { offset, splatCount: pack.splatCount }); // TEMP DEBUG (perf investigation)
         this._applyPack(pack, offset);
         // Render the decode pass at the start of a frame (the safe point for custom render targets),
         // once the shader is compiled — never re-entrantly from a promise/observable continuation.
@@ -194,7 +194,7 @@ export class GaussianSplattingWorkBuffer {
         if (this._disposed || !this._copyMaterial) {
             return;
         }
-        gsDebugLog("workBuffer.relayoutSync", { textureSize: this._textureSize }); // TEMP DEBUG (perf investigation)
+        GsDebugLog("workBuffer.relayoutSync", { textureSize: this._textureSize }); // TEMP DEBUG (perf investigation)
         const size = this._textureSize;
         // Reuse the map buffer and its GPU texture across relayouts (the work-buffer size is fixed).
         if (!this._relayoutMapData) {
@@ -291,7 +291,7 @@ export class GaussianSplattingWorkBuffer {
         if (this._disposed || splatCount <= 0 || !this.supportsAsyncCentersReadback) {
             return null;
         }
-        gsDebugLog("workBuffer.readCentersRangeAsync", { splatOffset, splatCount, isWebGPU: this._scene.getEngine().isWebGPU }); // TEMP DEBUG (perf investigation)
+        GsDebugLog("workBuffer.readCentersRangeAsync", { splatOffset, splatCount, isWebGPU: this._scene.getEngine().isWebGPU }); // TEMP DEBUG (perf investigation)
 
         const width = this._textureSize;
         // The range maps to whole texel rows [rowStart, rowEnd); read that rectangle and slice the exact range.
