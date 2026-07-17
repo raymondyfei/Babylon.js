@@ -31,6 +31,12 @@ import { GaussianSplattingSortWorker, GaussianSplattingSortWorkerCommand } from 
 // eslint-disable-next-line @typescript-eslint/naming-convention
 declare const _native: INative;
 
+// TEMP DEBUG (perf investigation): safe timestamp helper for [GS-DEBUG-CORE] logging (performance may be
+// undefined on Babylon Native). Remove alongside every [GS-DEBUG-CORE] console.log call site once resolved.
+function GsDbgNow(): number {
+    return Math.round(typeof performance !== "undefined" ? performance.now() : Date.now());
+}
+
 /** Internal mirror of ISogTexturePack (defined in loaders) — avoids a circular import. */
 interface ISogPackInternal {
     version: 1 | 2;
@@ -1300,6 +1306,10 @@ export class GaussianSplattingMeshBase extends Mesh {
         const previousWorld = cameraViewInfo.sortWorldMatrix.m;
         for (let i = 0; i < previousWorld.length; i++) {
             if (!Scalar.WithinEpsilon(previousWorld[i], world[i], this.viewUpdateThreshold)) {
+                // eslint-disable-next-line no-console
+                console.log(
+                    `[GS-DEBUG-CORE][isSortStateDirty] ${JSON.stringify({ t: GsDbgNow(), reason: "worldMatrix", i, prev: previousWorld[i], cur: world[i], threshold: this.viewUpdateThreshold })}`
+                ); // TEMP DEBUG (perf investigation)
                 return true;
             }
         }
@@ -1314,15 +1324,37 @@ export class GaussianSplattingMeshBase extends Mesh {
             !Scalar.WithinEpsilon(cameraViewInfo.sortCameraForward.y, cameraViewMatrix.m[6], this.viewUpdateThreshold) ||
             !Scalar.WithinEpsilon(cameraViewInfo.sortCameraForward.z, cameraViewMatrix.m[10], this.viewUpdateThreshold)
         ) {
+            // eslint-disable-next-line no-console
+            console.log(
+                `[GS-DEBUG-CORE][isSortStateDirty] ${JSON.stringify({
+                    t: GsDbgNow(),
+                    reason: "cameraForward",
+                    prev: [cameraViewInfo.sortCameraForward.x, cameraViewInfo.sortCameraForward.y, cameraViewInfo.sortCameraForward.z],
+                    cur: [cameraViewMatrix.m[2], cameraViewMatrix.m[6], cameraViewMatrix.m[10]],
+                    threshold: this.viewUpdateThreshold,
+                })}`
+            ); // TEMP DEBUG (perf investigation)
             return true;
         }
 
         const cameraPosition = camera.globalPosition;
-        return (
+        const _positionDirty =
             !Scalar.WithinEpsilon(cameraViewInfo.sortCameraPosition.x, cameraPosition.x, this.viewUpdateThreshold) ||
             !Scalar.WithinEpsilon(cameraViewInfo.sortCameraPosition.y, cameraPosition.y, this.viewUpdateThreshold) ||
-            !Scalar.WithinEpsilon(cameraViewInfo.sortCameraPosition.z, cameraPosition.z, this.viewUpdateThreshold)
-        );
+            !Scalar.WithinEpsilon(cameraViewInfo.sortCameraPosition.z, cameraPosition.z, this.viewUpdateThreshold);
+        if (_positionDirty) {
+            // eslint-disable-next-line no-console
+            console.log(
+                `[GS-DEBUG-CORE][isSortStateDirty] ${JSON.stringify({
+                    t: GsDbgNow(),
+                    reason: "cameraPosition",
+                    prev: [cameraViewInfo.sortCameraPosition.x, cameraViewInfo.sortCameraPosition.y, cameraViewInfo.sortCameraPosition.z],
+                    cur: [cameraPosition.x, cameraPosition.y, cameraPosition.z],
+                    threshold: this.viewUpdateThreshold,
+                })}`
+            ); // TEMP DEBUG (perf investigation)
+        }
+        return _positionDirty;
     }
 
     /** @internal */
@@ -1403,7 +1435,12 @@ export class GaussianSplattingMeshBase extends Mesh {
             activeViewInfos.forEach((cameraViewInfos) => {
                 const camera = cameraViewInfos.camera;
                 const cameraDirection = this._getCameraDirection(camera);
-                if ((forced || this._isSortStateDirty(cameraViewInfos, worldMatrix, camera)) && this._canPostToWorker) {
+                const _isDirty = this._isSortStateDirty(cameraViewInfos, worldMatrix, camera); // TEMP DEBUG (perf investigation)
+                if ((forced || _isDirty) && this._canPostToWorker) {
+                    // eslint-disable-next-line no-console
+                    console.log(
+                        `[GS-DEBUG-CORE][postToWorker.sortPosted] ${JSON.stringify({ t: GsDbgNow(), forced, isDirty: _isDirty, cameraId: camera.uniqueId, activeRangeVersion: this._activeRangeVersion, renderedSplatCount: this.renderedSplatCount })}`
+                    ); // TEMP DEBUG (perf investigation)
                     const cameraViewMatrix = camera.getViewMatrix();
                     cameraViewInfos.cameraDirection.copyFrom(cameraDirection);
                     cameraViewInfos.sortWorldMatrix.copyFrom(worldMatrix);
@@ -3113,6 +3150,16 @@ export class GaussianSplattingMeshBase extends Mesh {
             // version (the active ranges changed while it was in flight). Applying it would render indices
             // that belong to a different active set.
             if (e.data.depthMix.length != renderedPadded || e.data.rangeVersion !== this._activeRangeVersion) {
+                // eslint-disable-next-line no-console
+                console.log(
+                    `[GS-DEBUG-CORE][onmessage.discardMismatch] ${JSON.stringify({
+                        t: GsDbgNow(),
+                        depthMixLen: e.data.depthMix.length,
+                        renderedPadded,
+                        msgRangeVersion: e.data.rangeVersion,
+                        curRangeVersion: this._activeRangeVersion,
+                    })}`
+                ); // TEMP DEBUG (perf investigation)
                 // Only re-enable posting and trigger a re-sort if the buffer is available.
                 // If byteLength === 0 the buffer is already in-flight for a newer sort;
                 // that sort's onmessage will handle things when it returns.
@@ -3132,6 +3179,8 @@ export class GaussianSplattingMeshBase extends Mesh {
             // until this matching sort lands. Resize it now (the active count may have grown/shrunk since the
             // last applied sort) and rebind it for every known camera.
             if (!this._splatIndex || this._splatIndex.length !== renderedPadded) {
+                // eslint-disable-next-line no-console
+                console.log(`[GS-DEBUG-CORE][onmessage.fullReallocation] ${JSON.stringify({ t: GsDbgNow(), oldLength: this._splatIndex?.length, newLength: renderedPadded })}`); // TEMP DEBUG (perf investigation)
                 this._splatIndex = new Float32Array(renderedPadded);
                 this._cameraViewInfos.forEach((info) => {
                     info.mesh.thinInstanceSetBuffer("splatIndex", this._splatIndex, 16, false);
@@ -3175,8 +3224,12 @@ export class GaussianSplattingMeshBase extends Mesh {
             const cameraViewInfos = this._cameraViewInfos.get(cameraId);
             if (cameraViewInfos) {
                 if (cameraViewInfos.splatIndexBufferSet) {
+                    // eslint-disable-next-line no-console
+                    console.log(`[GS-DEBUG-CORE][onmessage.thinInstanceBufferUpdated] ${JSON.stringify({ t: GsDbgNow(), renderedPadded })}`); // TEMP DEBUG (perf investigation)
                     cameraViewInfos.mesh.thinInstanceBufferUpdated("splatIndex");
                 } else {
+                    // eslint-disable-next-line no-console
+                    console.log(`[GS-DEBUG-CORE][onmessage.thinInstanceSetBuffer] ${JSON.stringify({ t: GsDbgNow(), renderedPadded })}`); // TEMP DEBUG (perf investigation)
                     cameraViewInfos.mesh.thinInstanceSetBuffer("splatIndex", this._splatIndex, 16, false);
                     cameraViewInfos.splatIndexBufferSet = true;
                 }
