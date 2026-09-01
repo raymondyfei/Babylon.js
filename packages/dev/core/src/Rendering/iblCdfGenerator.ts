@@ -315,7 +315,11 @@ export class IblCdfGenerator {
             { width: size.width, height: size.height },
             "iblScaledLuminance",
             this._scene,
-            { ...cdfOptions, samplingMode: Constants.TEXTURE_TRILINEAR_SAMPLINGMODE, generateMipMaps: true },
+            // This texture is trilinear-filtered and mip-mapped, so it must use a filterable format.
+            // r16float is filterable everywhere (no optional feature required) and is sufficient here:
+            // the value only ever feeds a ratio (pixelLuminance / normalization) used as an
+            // importance-sampling weight, well within r16float's range and precision.
+            { ...cdfOptions, type: Constants.TEXTURETYPE_HALF_FLOAT, samplingMode: Constants.TEXTURE_TRILINEAR_SAMPLINGMODE, generateMipMaps: true },
             true,
             false
         );
