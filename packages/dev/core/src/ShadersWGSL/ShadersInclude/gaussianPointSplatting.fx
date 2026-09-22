@@ -1,0 +1,192 @@
+// Shared math for Gaussian Point Splatting (WebGPU stochastic point splatting).
+//
+// Per-pixel visibility uses a single atomic<u32> packing [depth : high 16 bits | color : low 16
+// bits as RGB565]. atomicMin keeps the nearest sample (smallest depth key) with its color riding
+// along. A full-float accumulation buffer (see gpsResolve) plus per-sample color dithering (see
+// gpsSplat) recovers RGB565 precision across frames.
+
+const GPS_DEPTH_CLEAR : u32 = 0xFFFFFFFFu;
+const GPS_TWO_PI : f32 = 6.2831853071795864;
+const GPS_U32_TO_UNIT : f32 = 2.3283064365386963e-10; // 1 / 2^32
+
+struct GpsUniforms {
+    view : mat4x4f,
+    viewProjection : mat4x4f,
+    resNearFar : vec4f, // x=width, y=height, z=near, w=far
+    params0 : vec4f,    // x=gaussianCount, y=kernelSize, z=pointScale, w=frameSeed
+    focal : vec4f,      // x,y = focal length in pixels; z = reverse-Z flag; w unused
+    camPosDeg : vec4f,  // xyz = camera world position, w = SH degree
+    depthNorm : vec4f,  // x,y = the model's NDC-z min/max this frame; zw unused
+    invWorldRot0 : vec4f, // xyz = row 0 of inverse(world 3x3); transforms the SH view dir to splat-local space
+    invWorldRot1 : vec4f, // xyz = row 1
+    invWorldRot2 : vec4f, // xyz = row 2
+    tuning : vec4f,       // x = footprint sigma scale, y = clip Mahalanobis^2, zw unused
+};
+
+// Spherical-harmonics basis constants (standard 3DGS ordering). SH_C0 is baked into the DC color.
+const GPS_SH_C1 : f32 = 0.48860251;
+const GPS_SH_C2 : array<f32, 5> = array<f32, 5>(1.092548430, -1.09254843, 0.315391565, -1.09254843, 0.546274215);
+const GPS_SH_C3 : array<f32, 7> = array<f32, 7>(-0.59004358, 2.890611442, -0.45704579, 0.373176332, -0.45704579, 1.445305721, -0.59004358);
+
+// Per-Gaussian screen-space state produced by gpsPreprocess and consumed by gpsSplat (64 bytes).
+struct GpsScreen {
+    pmConicXY : vec4f, // pixelMean.x, pixelMean.y, conic.x, conic.y
+    conicZChol : vec4f, // conic.z, chol0, chol1, chol2
+    colorOp : vec4f,   // linear color r, g, b, opacity
+    depth : vec4u,     // depthKey, unused, unused, unused
+};
+
+fn gpsGetPixelMean(s : GpsScreen) -> vec2f { return s.pmConicXY.xy; }
+fn gpsGetConic(s : GpsScreen) -> vec3f { return vec3f(s.pmConicXY.z, s.pmConicXY.w, s.conicZChol.x); }
+fn gpsGetChol(s : GpsScreen) -> vec3f { return s.conicZChol.yzw; }
+
+fn gpsPackRGB565(c : vec3f) -> u32 {
+    let r = u32(clamp(c.r, 0.0, 1.0) * 31.0 + 0.5);
+    let g = u32(clamp(c.g, 0.0, 1.0) * 63.0 + 0.5);
+    let b = u32(clamp(c.b, 0.0, 1.0) * 31.0 + 0.5);
+    return (r << 11u) | (g << 5u) | b;
+}
+
+fn gpsUnpackRGB565(v : u32) -> vec3f {
+    return vec3f(
+        f32((v >> 11u) & 31u) / 31.0,
+        f32((v >> 5u) & 63u) / 63.0,
+        f32(v & 31u) / 31.0
+    );
+}
+
+// Depth in the high 16 bits so atomicMin over the packed key resolves the nearest sample.
+fn gpsPackKey(depthKey : u32, colorKey : u32) -> u32 {
+    return (depthKey << 16u) | (colorKey & 0xFFFFu);
+}
+
+fn gpsKeyColor(key : u32) -> vec3f {
+    return gpsUnpackRGB565(key & 0xFFFFu);
+}
+
+// Nearest view-space depth maps to the smallest key. viewZ is expected positive-forward (LH).
+fn gpsQuantizeDepth(viewZ : f32, near : f32, far : f32) -> u32 {
+    let n = clamp((viewZ - near) / max(1e-6, far - near), 0.0, 1.0);
+    return u32(n * 65535.0);
+}
+
+// --- Random sampling (PCG hash) ---
+
+fn gpsPcg(vIn : u32) -> u32 {
+    let state = vIn * 747796405u + 2891336453u;
+    let word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+fn gpsHash2(a : u32, b : u32) -> u32 {
+    return gpsPcg(a ^ gpsPcg(b));
+}
+
+fn gpsUnit(state : u32) -> f32 {
+    return f32(state) * GPS_U32_TO_UNIT;
+}
+
+// Standard normal pair from two uniforms.
+fn gpsBoxMuller(u1 : f32, u2 : f32) -> vec2f {
+    let r = sqrt(-2.0 * log(max(1e-7, u1)));
+    let theta = GPS_TWO_PI * u2;
+    return vec2f(r * cos(theta), r * sin(theta));
+}
+
+// --- Unbiased 2D splatting (paper's method) ---
+// Dilogarithm Li2(x) and its inverse (polynomial fits, from the reference), used to importance-sample
+// the Gaussian so that emitting all points and taking the atomicMin coverage yields exactly
+// opacity*gaussian per pixel (matching alpha blending), with no per-sample stochastic rejection.
+
+const GPS_LI2_MAX : f32 = 1.6449340668482264; // Li2(1) = pi^2 / 6
+
+fn gpsDilog(x : f32) -> f32 {
+    var y = -6.09201442e-01;
+    y = y * x + 1.79126616e+00;
+    y = y * x + -2.14953223e+00;
+    y = y * x + 1.26304372e+00;
+    y = y * x + -4.59069895e-01;
+    y = y * x + -1.87417414e-01;
+    y = y * x + 1.99603130e+00;
+    y = y * x + 5.99669467e-05;
+    let s = 1.0 - x;
+    if (s > 0.0) {
+        y += s * log(max(s, 1e-37));
+    }
+    return y;
+}
+
+fn gpsInvDilog(x : f32) -> f32 {
+    let t = min(x / GPS_LI2_MAX, 1.0);
+    var y = -1.27463503e+01;
+    y = y * t + 5.88993459e+01;
+    y = y * t + -1.16025780e+02;
+    y = y * t + 1.26945827e+02;
+    y = y * t + -8.43108826e+01;
+    y = y * t + 3.48799862e+01;
+    y = y * t + -8.89606235e+00;
+    y = y * t + 1.38640936e+00;
+    y = y * t + -7.80640876e-01;
+    y = y * t + 1.64841888e+00;
+    y = y * t + -2.82836687e-05;
+    return y;
+}
+
+// Importance-sampled Gaussian offset (in standard-normal units) for opacity `alpha`.
+fn gpsCorrectedBoxMuller(u1 : f32, u2 : f32, alpha : f32) -> vec2f {
+    var a = (1.0 / max(alpha, 1e-37)) * gpsInvDilog((1.0 - u1) * gpsDilog(alpha));
+    a = clamp(a, 1e-37, 1.0);
+    let r = sqrt(max(-2.0 * log(a), 0.0));
+    let theta = GPS_TWO_PI * u2;
+    return vec2f(r * cos(theta), r * sin(theta));
+}
+
+// Poisson sample. Exact Knuth for small lambda (where the normal approximation is unstable and
+// over-counts — which shows up as a bright halo around silhouettes made of small edge splats), and
+// Giles' QN3 normal asymptotic approximation (Algorithm 955) for large lambda where Knuth is slow.
+fn gpsPoisson(seed : u32, lambda : f32) -> u32 {
+    if (lambda < 12.0) {
+        let lTarget = exp(-lambda);
+        var k = 0u;
+        var p = 1.0;
+        var st = seed;
+        loop {
+            k += 1u;
+            st = gpsPcg(st);
+            p = p * gpsUnit(st);
+            if (p <= lTarget) {
+                break;
+            }
+            if (k > 300u) {
+                break;
+            }
+        }
+        return k - 1u;
+    }
+
+    let st1 = gpsPcg(seed);
+    let st2 = gpsPcg(st1);
+    let w = gpsBoxMuller(gpsUnit(st1), gpsUnit(st2)).x;
+    let w2 = w * w;
+    let w3 = w2 * w;
+    let w4 = w2 * w2;
+    let s = sqrt(lambda);
+    let invS = 1.0 / s;
+    let invL = 1.0 / lambda;
+    var kf = lambda + s * w + (w2 - 1.0) / 6.0;
+    kf += invS * (-(1.0 / 36.0) * w - (1.0 / 72.0) * w3);
+    kf += invL * (-(8.0 / 405.0) + (7.0 / 810.0) * w2 + (1.0 / 270.0) * w4);
+    return u32(max(i32(round(kf)), 0));
+}
+
+// Round x to an integer, carrying the fraction stochastically (rand in [0,1)).
+fn gpsStochasticRound(x : f32, rand : f32) -> u32 {
+    let f = floor(x);
+    return u32(f) + select(0u, 1u, rand < (x - f));
+}
+
+// exp(-1/2 d^T conic d), conic = inverse 2D covariance packed as (c00, c01, c11).
+fn gpsGaussianValue(conic : vec3f, d : vec2f) -> f32 {
+    let power = -0.5 * (conic.x * d.x * d.x + conic.z * d.y * d.y) - conic.y * d.x * d.y;
+    return exp(power);
+}

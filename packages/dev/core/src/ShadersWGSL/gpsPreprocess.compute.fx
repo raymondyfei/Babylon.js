@@ -1,0 +1,186 @@
+// Gaussian Point Splatting — preprocess kernel. One invocation per Gaussian: transform to view/clip
+// space, project the 3D covariance to a 2D screen-space covariance (EWA), frustum cull, and cache
+// the screen-space state the splat kernel needs (pixel mean, conic, Cholesky factor, color, opacity,
+// depth key). Emits a stochastic point count proportional to the Gaussian's screen-space mass.
+#include<gaussianPointSplatting>
+
+@group(0) @binding(0) var<storage, read> means : array<vec4f>;
+@group(0) @binding(1) var<storage, read> colorOpacity : array<u32>;
+@group(0) @binding(2) var<storage, read_write> weights : array<u32>;
+@group(0) @binding(3) var<storage, read_write> gsData : array<GpsScreen>;
+@group(0) @binding(4) var<uniform> uniforms : GpsUniforms;
+@group(0) @binding(5) var<storage, read> cov3d : array<vec4f>; // 2 vec4 per Gaussian: (S00,S01,S02,S11),(S12,S22,-,-)
+@group(0) @binding(6) var<storage, read> sh : array<f32>; // dequantized SH coeffs, interleaved RGB, shDim*3 floats per Gaussian
+
+// One SH coefficient (RGB) for Gaussian at scalar-base `base`, coefficient index `j`.
+fn gpsShCoeff(base : u32, j : u32) -> vec3f {
+    let o = base + j * 3u;
+    return vec3f(sh[o], sh[o + 1u], sh[o + 2u]);
+}
+
+// View-dependent SH color delta (degrees 1..3; DC is already baked into the base color).
+fn gpsEvalShDelta(g : u32, dir : vec3f, degree : u32) -> vec3f {
+    let shDim = select(select(15u, 8u, degree == 2u), 3u, degree == 1u);
+    let base = g * shDim * 3u;
+    let x = dir.x;
+    let y = dir.y;
+    let z = dir.z;
+
+    var res = -GPS_SH_C1 * y * gpsShCoeff(base, 0u) + GPS_SH_C1 * z * gpsShCoeff(base, 1u) - GPS_SH_C1 * x * gpsShCoeff(base, 2u);
+
+    if (degree >= 2u) {
+        let xx = x * x;
+        let yy = y * y;
+        let zz = z * z;
+        res += GPS_SH_C2[0] * (x * y) * gpsShCoeff(base, 3u)
+            + GPS_SH_C2[1] * (y * z) * gpsShCoeff(base, 4u)
+            + GPS_SH_C2[2] * (2.0 * zz - xx - yy) * gpsShCoeff(base, 5u)
+            + GPS_SH_C2[3] * (x * z) * gpsShCoeff(base, 6u)
+            + GPS_SH_C2[4] * (xx - yy) * gpsShCoeff(base, 7u);
+
+        if (degree >= 3u) {
+            res += GPS_SH_C3[0] * y * (3.0 * xx - yy) * gpsShCoeff(base, 8u)
+                + GPS_SH_C3[1] * (x * y) * z * gpsShCoeff(base, 9u)
+                + GPS_SH_C3[2] * y * (4.0 * zz - xx - yy) * gpsShCoeff(base, 10u)
+                + GPS_SH_C3[3] * z * (2.0 * zz - 3.0 * xx - 3.0 * yy) * gpsShCoeff(base, 11u)
+                + GPS_SH_C3[4] * x * (4.0 * zz - xx - yy) * gpsShCoeff(base, 12u)
+                + GPS_SH_C3[5] * z * (xx - yy) * gpsShCoeff(base, 13u)
+                + GPS_SH_C3[6] * x * (xx - 3.0 * yy) * gpsShCoeff(base, 14u);
+        }
+    }
+    return res;
+}
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) gid : vec3u) {
+    let g = gid.x;
+    let count = u32(uniforms.params0.x);
+    if (g >= count) {
+        return;
+    }
+    weights[g] = 0u;
+
+    let mean = means[g].xyz;
+    let near = uniforms.resNearFar.z;
+    let far = uniforms.resNearFar.w;
+
+    let camspace = uniforms.view * vec4f(mean, 1.0);
+    let clip = uniforms.viewProjection * vec4f(mean, 1.0);
+    if (clip.w <= 0.0) {
+        return;
+    }
+    // View-space forward distance, handedness-agnostic (LH: +z, RH: -z).
+    let viewDepth = abs(camspace.z);
+    if (viewDepth <= near) {
+        return;
+    }
+    let ndc = clip.xyz / clip.w;
+    if (ndc.x < -1.3 || ndc.x > 1.3 || ndc.y < -1.3 || ndc.y > 1.3) {
+        return;
+    }
+
+    // EWA projection of the 3D covariance to 2D screen space (same construction as the classic
+    // rasterizer's gaussianSplatting()).
+    let c0 = cov3d[2u * g];
+    let c1 = cov3d[2u * g + 1u];
+    let covA = c0.xyz;             // S00, S01, S02
+    let covB = vec3f(c0.w, c1.x, c1.y); // S11, S12, S22
+    let Vrk = mat3x3f(covA.x, covA.y, covA.z, covA.y, covB.x, covB.y, covA.z, covB.y, covB.z);
+
+    let focal = uniforms.focal.xy;
+    let J = mat3x3f(
+        focal.x / camspace.z, 0.0, -(focal.x * camspace.x) / (camspace.z * camspace.z),
+        0.0, focal.y / camspace.z, -(focal.y * camspace.y) / (camspace.z * camspace.z),
+        0.0, 0.0, 0.0
+    );
+    let mv = uniforms.view;
+    let T = transpose(mat3x3f(mv[0].xyz, mv[1].xyz, mv[2].xyz)) * J;
+    var cov2d = transpose(T) * Vrk * T;
+
+    // Empirical footprint scale (tuning.x): shrinks every splat's screen footprint to match the
+    // classic rasterizer's tighter silhouette and sharper interior. Point density is preserved (the
+    // importance below uses the scaled det), so per-pixel coverage stays opacity*gaussian.
+    let sig2 = uniforms.tuning.x * uniforms.tuning.x;
+    cov2d[0][0] *= sig2;
+    cov2d[0][1] *= sig2;
+    cov2d[1][1] *= sig2;
+
+    // Determinant before the low-pass dilation, for the EWA opacity compensation below.
+    let kernelSize = uniforms.params0.y;
+    cov2d[0][0] += kernelSize;
+    cov2d[1][1] += kernelSize;
+
+    let a = cov2d[0][0];
+    let b = cov2d[0][1];
+    let cc = cov2d[1][1];
+    let det = a * cc - b * b;
+    if (det <= 0.0) {
+        return;
+    }
+
+    // Conic = inverse 2D covariance; Cholesky L (lower) so a sample = mean + L * N(0,1).
+    let invDet = 1.0 / det;
+    let conic = vec3f(cc * invDet, -b * invDet, a * invDet);
+    let chol0 = sqrt(a);
+    let chol1 = b / chol0;
+    let chol2 = sqrt(max(0.0, cc - chol1 * chol1));
+
+    let rgba = colorOpacity[g];
+    var color = vec3f(f32(rgba & 0xFFu), f32((rgba >> 8u) & 0xFFu), f32((rgba >> 16u) & 0xFFu)) / 255.0;
+    var opacity = f32((rgba >> 24u) & 0xFFu) / 255.0;
+
+    // View-dependent SH: add the higher-degree delta (DC is already baked into the base color).
+    let shDegree = u32(uniforms.camPosDeg.w);
+    if (shDegree >= 1u) {
+        // SH coefficients live in the splat's local frame, so transform the world-space eye->splat
+        // direction by the inverse world rotation before evaluating (matches the classic path).
+        let eyeToSplat = mean - uniforms.camPosDeg.xyz;
+        let dir = normalize(vec3f(
+            dot(uniforms.invWorldRot0.xyz, eyeToSplat),
+            dot(uniforms.invWorldRot1.xyz, eyeToSplat),
+            dot(uniforms.invWorldRot2.xyz, eyeToSplat)));
+        color += gpsEvalShDelta(g, dir, shDegree);
+    }
+
+    // Unbiased 2D splatting: importance = 2*pi*sqrt(det) * dilog(opacity) is the integral of the
+    // target point density -ln(1 - opacity*gaussian). Drawing a Poisson count and emitting all samples
+    // (importance-sampled via correctedBoxMuller) makes per-pixel coverage = 1 - exp(-density) equal
+    // exactly opacity*gaussian, matching the classic alpha blend. pointScale must stay 1 for that
+    // exactness (it only trades noise for cost); temporal accumulation denoises.
+    let importance = GPS_TWO_PI * sqrt(det) * gpsDilog(opacity) * uniforms.params0.z;
+    let res = uniforms.resNearFar.xy;
+    if (importance < 1e-4) {
+        return;
+    }
+    let seed = gpsHash2(g, u32(uniforms.params0.w));
+    var numPoints = gpsPoisson(gpsPcg(seed), importance);
+    // Cap so a single huge Gaussian cannot dominate the point budget.
+    numPoints = min(numPoints, u32(res.x * res.y * 0.5));
+    if (numPoints == 0u) {
+        return;
+    }
+
+    let px = (ndc.x * 0.5 + 0.5) * res.x;
+    let py = (ndc.y * 0.5 + 0.5) * res.y;
+
+    var s : GpsScreen;
+    s.pmConicXY = vec4f(px, py, conic.x, conic.y);
+    s.conicZChol = vec4f(conic.z, chol0, chol1, chol2);
+    s.colorOp = vec4f(color, opacity);
+    // Depth key: order so the NEAREST sample has the smallest key (atomicMin keeps it). Under
+    // reverse-Z (near = large NDC z) invert so nearest still maps to the smallest key. The true NDC z
+    // is recovered in resolve for fragDepth compositing against the (same-convention) depth buffer.
+    // Normalize the depth key to the model's own NDC-z span this frame (not the scene's [0,1]).
+    // The scene far plane can be huge, so raw NDC z gives the model only a few hundred of the 16-bit
+    // key's levels; hundreds of splats then collide on one level and the atomicMin can no longer pick
+    // the nearest, which averages overlapping splats and blurs fine detail. Remapping to the model's
+    // span restores the full 16-bit ordering resolution.
+    let dmin = uniforms.depthNorm.x;
+    let dmax = uniforms.depthNorm.y;
+    let dlin = clamp((ndc.z - dmin) / max(dmax - dmin, 1e-6), 0.0, 1.0);
+    let dord = select(dlin, 1.0 - dlin, uniforms.focal.z > 0.5);
+    s.depth = vec4u(u32(dord * 65535.0), 0u, 0u, 0u);
+    gsData[g] = s;
+
+    weights[g] = numPoints;
+}
