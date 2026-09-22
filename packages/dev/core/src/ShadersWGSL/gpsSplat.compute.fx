@@ -59,7 +59,7 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
     let z = gpsCorrectedBoxMuller(u1, u2, opacity);
     // Match the classic quad cutoff: meshPos in [-2,2] with a circular discard at |meshPos|>=2,
     // i.e. mahalanobis 2*sqrt(2) sigma. Our z is in standard-normal (mahalanobis) units, so |z|<2.83.
-    if (dot(z, z) > uniforms.tuning.y) {
+    if (dot(z, z) > 8.0) {
         return;
     }
     let offset = vec2f(chol.x * z.x, chol.y * z.x + chol.z * z.y);

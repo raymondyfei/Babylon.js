@@ -97,15 +97,9 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
     let T = transpose(mat3x3f(mv[0].xyz, mv[1].xyz, mv[2].xyz)) * J;
     var cov2d = transpose(T) * Vrk * T;
 
-    // Empirical footprint scale (tuning.x): shrinks every splat's screen footprint to match the
-    // classic rasterizer's tighter silhouette and sharper interior. Point density is preserved (the
-    // importance below uses the scaled det), so per-pixel coverage stays opacity*gaussian.
-    let sig2 = uniforms.tuning.x * uniforms.tuning.x;
-    cov2d[0][0] *= sig2;
-    cov2d[0][1] *= sig2;
-    cov2d[1][1] *= sig2;
-
-    // Determinant before the low-pass dilation, for the EWA opacity compensation below.
+    // Low-pass (antialiasing) dilation, matching the classic rasterizer's kernelSize. The screen-scale
+    // that cancels the classic quad's invViewport is baked into the covariance at load (see the mesh's
+    // updateData), so cov2d needs no per-frame scaling here.
     let kernelSize = uniforms.params0.y;
     cov2d[0][0] += kernelSize;
     cov2d[1][1] += kernelSize;

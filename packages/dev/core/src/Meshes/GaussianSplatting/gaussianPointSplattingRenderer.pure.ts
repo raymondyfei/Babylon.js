@@ -58,14 +58,6 @@ export class GaussianPointSplattingRenderer {
     /** Sample-density multiplier on the (importance-calibrated) point count. Keep at 1 for exact
      * coverage = opacity*gaussian; other values trade noise for cost but bias the alpha. */
     public pointScale = 1.0;
-    // The stochastic union of full-covariance Gaussians renders a softer silhouette and interior than
-    // the classic sorted-quad rasterizer of the same splats. These two knobs shrink and hard-clip each
-    // splat's screen footprint so the converged image matches the classic path (tuned to minimize the
-    // pixel difference to the rasterizer across views; ~2 RMS/channel).
-    /** Footprint sigma scale (1 = unscaled true Gaussian). */
-    public sigmaScale = 0.5;
-    /** Sample clip radius as Mahalanobis distance squared (8 = 2.83 sigma). */
-    public clipMahalSq = 8.0;
     /** 2D covariance dilation (sub-pixel antialiasing kernel), in pixels^2. */
     public kernelSize = 0.3;
     /** Whether the scene uses a reverse-Z depth buffer (near = large NDC z). */
@@ -163,7 +155,6 @@ export class GaussianPointSplattingRenderer {
         this._uniforms.addUniform("invWorldRot0", 4);
         this._uniforms.addUniform("invWorldRot1", 4);
         this._uniforms.addUniform("invWorldRot2", 4);
-        this._uniforms.addUniform("tuning", 4);
 
         this._resolveParams = new UniformBuffer(engine);
         this._resolveParams.addUniform("resolution", 2);
@@ -404,7 +395,6 @@ export class GaussianPointSplattingRenderer {
         this._uniforms.updateFloat4("invWorldRot0", r[0], r[1], r[2], 0);
         this._uniforms.updateFloat4("invWorldRot1", r[3], r[4], r[5], 0);
         this._uniforms.updateFloat4("invWorldRot2", r[6], r[7], r[8], 0);
-        this._uniforms.updateFloat4("tuning", this.sigmaScale, this.clipMahalSq, 0, 0);
         this._uniforms.update();
 
         this._resolveParams.updateFloat2("resolution", width, height);

@@ -153,8 +153,11 @@ export class GaussianPointSplattingMesh extends Mesh {
             quaternion.set((bytes[qb + 1] - 127.5) / 127.5, (bytes[qb + 2] - 127.5) / 127.5, (bytes[qb + 3] - 127.5) / 127.5, -(bytes[qb + 0] - 127.5) / 127.5);
             quaternion.normalize();
             quaternion.toRotationMatrix(rotation);
-            Matrix.ScalingToRef(floats[8 * i + 3] * 2, floats[8 * i + 4] * 2, floats[8 * i + 5] * 2, scale);
-            // Source 3D covariance Sigma = M M^T with M = R * S (scale doubled), matching the classic mesh.
+            // Source 3D covariance Sigma = M M^T with M = R * S. The classic mesh doubles the scale
+            // (rawScale * 2) and cancels it at render: its quad's invViewport = 1/renderWidth draws at
+            // half the projected pixel size (one pixel spans 2/renderWidth in NDC). This compute path
+            // has no quad, so it bakes the net scale directly (no * 2) to render at the same size.
+            Matrix.ScalingToRef(floats[8 * i + 3], floats[8 * i + 4], floats[8 * i + 5], scale);
             rotation.multiplyToRef(scale, rs);
             const m = rs.m;
             let s00 = m[0] * m[0] + m[1] * m[1] + m[2] * m[2];

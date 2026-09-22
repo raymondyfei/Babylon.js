@@ -20,7 +20,6 @@ struct GpsUniforms {
     invWorldRot0 : vec4f, // xyz = row 0 of inverse(world 3x3); transforms the SH view dir to splat-local space
     invWorldRot1 : vec4f, // xyz = row 1
     invWorldRot2 : vec4f, // xyz = row 2
-    tuning : vec4f,       // x = footprint sigma scale, y = clip Mahalanobis^2, zw unused
 };
 
 // Spherical-harmonics basis constants (standard 3DGS ordering). SH_C0 is baked into the DC color.
