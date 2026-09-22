@@ -22,7 +22,6 @@
         "Meshes/Builders/torusBuilder.ts": ["top-level-call"],
         "Meshes/Builders/torusKnotBuilder.ts": ["top-level-call"],
         "Meshes/Builders/tubeBuilder.ts": ["top-level-call"],
-        "Meshes/GaussianSplatting/gaussianPointSplattingMesh.ts": ["bare-import"],
         "Meshes/GaussianSplatting/gaussianPointSplattingRenderer.ts": ["bare-import"],
         "Meshes/GaussianSplatting/gaussianSplattingCompoundMesh.ts": ["top-level-call"],
         "Meshes/GaussianSplatting/gaussianSplattingDebugger.ts": ["bare-import"],

@@ -11,6 +11,7 @@
 @group(0) @binding(4) var<uniform> uniforms : GpsUniforms;
 @group(0) @binding(5) var<storage, read> cov3d : array<vec4f>; // 2 vec4 per Gaussian: (S00,S01,S02,S11),(S12,S22,-,-)
 @group(0) @binding(6) var<storage, read> sh : array<f32>; // dequantized SH coeffs, interleaved RGB, shDim*3 floats per Gaussian
+@group(0) @binding(7) var<storage, read> parts : array<GpsPart>; // per-part live world matrix + visibility
 
 // One SH coefficient (RGB) for Gaussian at scalar-base `base`, coefficient index `j`.
 fn gpsShCoeff(base : u32, j : u32) -> vec3f {
@@ -61,11 +62,16 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
     weights[g] = 0u;
 
     let mean = means[g].xyz;
+    // The part this splat belongs to (0 for a non-compound mesh). Its world matrix is applied here,
+    // per frame, so runtime transforms (gizmo, part add/remove) move the splats without re-baking.
+    let partIndex = u32(means[g].w);
+    let partWorld = parts[partIndex].world;
     let near = uniforms.resNearFar.z;
     let far = uniforms.resNearFar.w;
 
-    let camspace = uniforms.view * vec4f(mean, 1.0);
-    let clip = uniforms.viewProjection * vec4f(mean, 1.0);
+    let worldPos = (partWorld * vec4f(mean, 1.0)).xyz;
+    let camspace = uniforms.view * vec4f(worldPos, 1.0);
+    let clip = uniforms.viewProjection * vec4f(worldPos, 1.0);
     if (clip.w <= 0.0) {
         return;
     }
@@ -93,8 +99,12 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
         0.0, focal.y / camspace.z, -(focal.y * camspace.y) / (camspace.z * camspace.z),
         0.0, 0.0, 0.0
     );
-    let mv = uniforms.view;
-    let T = transpose(mat3x3f(mv[0].xyz, mv[1].xyz, mv[2].xyz)) * J;
+    // Fold the part's world transform into the projection the same way the classic rasterizer does:
+    // modelView = view * partWorld, then T = transpose(modelView3x3) * J. This is algebraically the
+    // same 2D covariance as baking A*Sigma*A^T on the CPU, but the world stays out of the stored
+    // (local) covariance so parts can move each frame.
+    let modelView = uniforms.view * partWorld;
+    let T = transpose(mat3x3f(modelView[0].xyz, modelView[1].xyz, modelView[2].xyz)) * J;
     var cov2d = transpose(T) * Vrk * T;
 
     // Low-pass (antialiasing) dilation, matching the classic rasterizer's kernelSize. The screen-scale
@@ -121,18 +131,17 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
 
     let rgba = colorOpacity[g];
     var color = vec3f(f32(rgba & 0xFFu), f32((rgba >> 8u) & 0xFFu), f32((rgba >> 16u) & 0xFFu)) / 255.0;
-    var opacity = f32((rgba >> 24u) & 0xFFu) / 255.0;
+    // Per-part visibility scales opacity (0 hides the part), matching the classic partVisibility path.
+    var opacity = f32((rgba >> 24u) & 0xFFu) / 255.0 * parts[partIndex].vis.x;
 
     // View-dependent SH: add the higher-degree delta (DC is already baked into the base color).
     let shDegree = u32(uniforms.camPosDeg.w);
     if (shDegree >= 1u) {
-        // SH coefficients live in the splat's local frame, so transform the world-space eye->splat
-        // direction by the inverse world rotation before evaluating (matches the classic path).
-        let eyeToSplat = mean - uniforms.camPosDeg.xyz;
-        let dir = normalize(vec3f(
-            dot(uniforms.invWorldRot0.xyz, eyeToSplat),
-            dot(uniforms.invWorldRot1.xyz, eyeToSplat),
-            dot(uniforms.invWorldRot2.xyz, eyeToSplat)));
+        // SH coefficients live in the splat's local frame, so bring the world-space eye->splat
+        // direction into that frame with the inverse of the part's world rotation (matches the classic
+        // vertex shader's inverseMat3(worldRot)).
+        let worldRot = mat3x3f(partWorld[0].xyz, partWorld[1].xyz, partWorld[2].xyz);
+        let dir = normalize(gpsInverseMat3(worldRot) * (worldPos - uniforms.camPosDeg.xyz));
         color += gpsEvalShDelta(g, dir, shDegree);
     }
 

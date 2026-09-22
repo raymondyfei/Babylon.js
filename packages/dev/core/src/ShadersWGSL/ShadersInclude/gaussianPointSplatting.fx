@@ -17,10 +17,31 @@ struct GpsUniforms {
     focal : vec4f,      // x,y = focal length in pixels; z = reverse-Z flag; w unused
     camPosDeg : vec4f,  // xyz = camera world position, w = SH degree
     depthNorm : vec4f,  // x,y = the model's NDC-z min/max this frame; zw unused
-    invWorldRot0 : vec4f, // xyz = row 0 of inverse(world 3x3); transforms the SH view dir to splat-local space
-    invWorldRot1 : vec4f, // xyz = row 1
-    invWorldRot2 : vec4f, // xyz = row 2
 };
+
+// One compound part's live transform. Kept out of the covariance (which is baked once, in local
+// space) because parts move at runtime: the world transform is applied per frame in the shader,
+// exactly like the classic rasterizer's per-part `partWorld`. A non-compound mesh is a single part.
+struct GpsPart {
+    world : mat4x4f, // part world matrix (local -> world), column-major
+    vis : vec4f,     // x = part visibility (0..1); yzw unused ('meta' is a reserved WGSL keyword)
+};
+
+// Inverse of a 3x3 matrix. Identical to core's helperFunctions inverseMat3 (kept local to avoid
+// pulling the whole include into a compute shader), so the SH view direction is brought into the
+// part's local frame exactly as the classic vertex shader does.
+fn gpsInverseMat3(inMatrix : mat3x3f) -> mat3x3f {
+    let a00 = inMatrix[0][0]; let a01 = inMatrix[0][1]; let a02 = inMatrix[0][2];
+    let a10 = inMatrix[1][0]; let a11 = inMatrix[1][1]; let a12 = inMatrix[1][2];
+    let a20 = inMatrix[2][0]; let a21 = inMatrix[2][1]; let a22 = inMatrix[2][2];
+    let b01 = a22 * a11 - a12 * a21;
+    let b11 = -a22 * a10 + a12 * a20;
+    let b21 = a21 * a10 - a11 * a20;
+    let det = a00 * b01 + a01 * b11 + a02 * b21;
+    return mat3x3f(b01 / det, (-a22 * a01 + a02 * a21) / det, (a12 * a01 - a02 * a11) / det,
+            b11 / det, (a22 * a00 - a02 * a20) / det, (-a12 * a00 + a02 * a10) / det,
+            b21 / det, (-a21 * a00 + a01 * a20) / det, (a11 * a00 - a01 * a10) / det);
+}
 
 // Spherical-harmonics basis constants (standard 3DGS ordering). SH_C0 is baked into the DC color.
 const GPS_SH_C1 : f32 = 0.48860251;

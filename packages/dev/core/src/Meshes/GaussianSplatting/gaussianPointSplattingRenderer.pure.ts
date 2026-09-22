@@ -87,9 +87,14 @@ export class GaussianPointSplattingRenderer {
     // The model's NDC-z span this frame; the depth key is normalized to it for full 16-bit ordering.
     private _ndczMin = 0;
     private _ndczMax = 1;
-    // Rows of inverse(world 3x3); default identity so the SH view dir is unchanged when no world is set.
-    private _invWorldRot = new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]);
     private _frameIndex = 0;
+
+    // Per-part live transforms (world matrix + visibility), uploaded each frame. A non-compound mesh
+    // is a single part. The GPU buffer is rebuilt only when the part count changes; a copy of the last
+    // uploaded values lets us restart accumulation when a part moves (otherwise stale frames ghost).
+    private _parts: Nullable<StorageBuffer> = null;
+    private _partCount = 0;
+    private _prevPartData: Float32Array = new Float32Array(0);
 
     // Progressive accumulation state.
     private _accumFrame = 0;
@@ -114,6 +119,7 @@ export class GaussianPointSplattingRenderer {
             uniforms: { group: 0, binding: 4 },
             cov3d: { group: 0, binding: 5 },
             sh: { group: 0, binding: 6 },
+            parts: { group: 0, binding: 7 },
         };
         this._preprocessCs = new ComputeShader("gpsPreprocess", engine, "gpsPreprocess", { bindingsMapping: preprocessBindings });
 
@@ -152,9 +158,6 @@ export class GaussianPointSplattingRenderer {
         this._uniforms.addUniform("focal", 4);
         this._uniforms.addUniform("camPosDeg", 4);
         this._uniforms.addUniform("depthNorm", 4);
-        this._uniforms.addUniform("invWorldRot0", 4);
-        this._uniforms.addUniform("invWorldRot1", 4);
-        this._uniforms.addUniform("invWorldRot2", 4);
 
         this._resolveParams = new UniformBuffer(engine);
         this._resolveParams.addUniform("resolution", 2);
@@ -313,12 +316,41 @@ export class GaussianPointSplattingRenderer {
     }
 
     /**
-     * Sets the rows of inverse(world 3x3), used to transform the SH view direction into the splat's
-     * local frame (where SH coefficients live). Row-major, 9 floats. Identity when no world transform.
-     * @param rows 9 floats: [r00,r01,r02, r10,r11,r12, r20,r21,r22]
+     * Uploads the live per-part transforms consumed by the preprocess shader. Each part contributes 20
+     * floats: 16 for its column-major world matrix followed by [visibility, 0, 0, 0]. Called every
+     * frame so runtime transforms (gizmo) and part visibility take effect without re-baking; the GPU
+     * buffer is only reallocated when the part count changes.
+     * @param packed part records, `count * 20` floats (world matrix + visibility per part)
+     * @param count number of parts (at least 1)
      */
-    public setInverseWorldRotation(rows: Float32Array): void {
-        this._invWorldRot.set(rows);
+    public setPartData(packed: Float32Array, count: number): void {
+        const engine = this._engine as WebGPUEngine;
+        const floats = count * 20;
+        // Restart accumulation whenever a part moved, changed visibility, or the part set changed —
+        // otherwise the progressive buffer blends pre-move frames into the new pose (a ghost trail).
+        let changed = !this._parts || this._partCount !== count || this._prevPartData.length !== floats;
+        if (!changed) {
+            for (let i = 0; i < floats; i++) {
+                if (this._prevPartData[i] !== packed[i]) {
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        if (!this._parts || this._partCount !== count) {
+            this._parts?.dispose();
+            // GpsPart is mat4x4f + vec4f = 80 bytes (20 floats) per part in std430.
+            this._parts = new StorageBuffer(engine, floats * Float32Array.BYTES_PER_ELEMENT);
+            this._partCount = count;
+        }
+        if (changed) {
+            if (this._prevPartData.length !== floats) {
+                this._prevPartData = new Float32Array(floats);
+            }
+            this._prevPartData.set(packed);
+            this.resetAccumulation();
+        }
+        this._parts.update(packed);
     }
 
     private _ensurePixelBuffers(width: number, height: number): void {
@@ -362,7 +394,7 @@ export class GaussianPointSplattingRenderer {
         }
         this._ensurePixelBuffers(width, height);
 
-        if (this._gaussianCount === 0 || !this._view || !this._viewProjection || !this.isReady()) {
+        if (this._gaussianCount === 0 || !this._parts || !this._view || !this._viewProjection || !this.isReady()) {
             return false;
         }
 
@@ -391,10 +423,6 @@ export class GaussianPointSplattingRenderer {
         this._uniforms.updateFloat4("focal", this._focalX, this._focalY, reverseZ, 0);
         this._uniforms.updateFloat4("camPosDeg", this._camX, this._camY, this._camZ, this._shDegree);
         this._uniforms.updateFloat4("depthNorm", this._ndczMin, this._ndczMax, 0, 0);
-        const r = this._invWorldRot;
-        this._uniforms.updateFloat4("invWorldRot0", r[0], r[1], r[2], 0);
-        this._uniforms.updateFloat4("invWorldRot1", r[3], r[4], r[5], 0);
-        this._uniforms.updateFloat4("invWorldRot2", r[6], r[7], r[8], 0);
         this._uniforms.update();
 
         this._resolveParams.updateFloat2("resolution", width, height);
@@ -413,6 +441,7 @@ export class GaussianPointSplattingRenderer {
         this._preprocessCs.setUniformBuffer("uniforms", this._uniforms);
         this._preprocessCs.setStorageBuffer("cov3d", this._cov3d!);
         this._preprocessCs.setStorageBuffer("sh", this._sh!);
+        this._preprocessCs.setStorageBuffer("parts", this._parts!);
         this._preprocessCs.dispatch(groupsG, 1, 1);
 
         this._scanBlocksCs.setStorageBuffer("weights", this._weights!);
@@ -479,6 +508,9 @@ export class GaussianPointSplattingRenderer {
         this._accumDepth = null;
         this._imageBuffer = null;
         this._accumBuffer = null;
+        this._parts?.dispose();
+        this._parts = null;
+        this._partCount = 0;
         this._pointCount.dispose();
         this._indirectArgs.dispose();
         this._uniforms.dispose();

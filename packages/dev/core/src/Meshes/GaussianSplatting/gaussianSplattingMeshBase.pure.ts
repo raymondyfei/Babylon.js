@@ -1596,7 +1596,7 @@ export class GaussianSplattingMeshBase extends Mesh {
             mesh.setMaterialForRenderPass(renderPassId, renderPassMaterial);
         }
 
-        const ret = mesh.render(subMesh, enableAlphaMode, effectiveMeshReplacement);
+        const ret = this._drawColorPass(mesh, subMesh, enableAlphaMode, effectiveMeshReplacement);
 
         this._hasRenderedOnce = true;
 
@@ -1609,6 +1609,21 @@ export class GaussianSplattingMeshBase extends Mesh {
             this.onAfterRenderObservable.notifyObservers(this);
         }
         return ret;
+    }
+
+    /**
+     * Draws the camera-view color for one render pass. The default rasterizes the sorted-quad geometry
+     * via the inner per-camera mesh. Subclasses may override this to substitute an alternate color
+     * renderer (e.g. compute point splatting) for the main color pass only, leaving all other passes —
+     * shadow depth, GPU picking, IBL voxelization, prepass — to render the classic geometry unchanged.
+     * @param mesh the inner per-camera mesh carrying the sorted splat geometry
+     * @param subMesh the submesh to draw
+     * @param enableAlphaMode whether alpha mode can be changed
+     * @param effectiveMeshReplacement optional mesh providing render info
+     * @returns the drawn mesh
+     */
+    protected _drawColorPass(mesh: Mesh, subMesh: SubMesh, enableAlphaMode: boolean, effectiveMeshReplacement?: AbstractMesh): Mesh {
+        return mesh.render(subMesh, enableAlphaMode, effectiveMeshReplacement);
     }
 
     private static _TypeNameToEnum(name: string): PLYType {
